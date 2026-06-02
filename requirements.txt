@@ -2,4 +2,6 @@ flask
 openai
 httpx
 python-dotenv
+cachetools
 gunicorn
+

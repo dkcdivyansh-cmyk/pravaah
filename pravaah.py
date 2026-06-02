@@ -11,15 +11,17 @@ import os
 from typing import Optional
 
 from dotenv import load_dotenv
-from flask import Flask, Response, request, stream_with_context
+from flask import Flask, Response, request, stream_with_context, jsonify
 from openai import OpenAI
 import httpx
+import hashlib
+from cachetools import TTLCache
 
 load_dotenv()
 
 API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5").strip()
+BASE_URL = os.getenv("OPENAI_BASE_URL", "https://integrate.api.nvidia.com/v1").strip()
+MODEL = os.getenv("OPENAI_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2").strip()
 PORT = int(os.getenv("PORT") or os.getenv("PRAVAAH_PORT") or "5000")
 DEBUG = os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
 VERIFY_SSL = os.getenv("PRAVAAH_VERIFY_SSL", "true").lower() not in ("0", "false", "no")
@@ -43,11 +45,14 @@ if not API_KEY:
     )
 
 http_client = httpx.Client(
-    timeout=httpx.Timeout(60.0, connect=20.0),
+    timeout=httpx.Timeout(30.0, connect=5.0),
     verify=VERIFY_SSL,
 )
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL, http_client=http_client)
 app = Flask(__name__)
+
+# Strictly bounded in-memory cache: max 50 entries, 5-minute TTL
+prompt_cache = TTLCache(maxsize=50, ttl=300)
 
 
 def load_custom_instructions() -> str:
@@ -617,11 +622,15 @@ def render_index() -> str:
 
 @app.route("/")
 def index():
-    return render_index()
+    try:
+        return render_index()
+    except Exception as e:
+        return jsonify({"error": "Failed to load UI", "detail": str(e)}), 500
 
 
 @app.route("/chat", methods=["POST"])
 def chat():
+  try:
     data = request.get_json(silent=True) or {}
     messages = data.get("messages", [])
     model = (data.get("model") or MODEL).strip()
@@ -630,6 +639,18 @@ def chat():
     payload_messages = []
     if system_instruction:
         payload_messages.append({"role": "system", "content": system_instruction})
+    
+    # Quick cache lookup before building payload
+    cache_key = hashlib.sha256(json.dumps(messages, sort_keys=True).encode()).hexdigest()
+    if cache_key in prompt_cache:
+        cached_text = prompt_cache[cache_key]
+        def cached_gen():
+            # Stream cached response as a single SSE chunk
+            payload = {"choices": [{"delta": {"content": cached_text}}]}
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        return Response(stream_with_context(cached_gen()), mimetype="text/event-stream")
+
     if isinstance(messages, list):
         for m in messages:
             if not isinstance(m, dict):
@@ -652,7 +673,7 @@ def chat():
                 "model": model,
                 "messages": payload_messages,
                 "stream": True,
-                "max_tokens": 4096,
+                "max_tokens": 300,
             }
             if extra_body:
                 # OpenAI-compatible providers (e.g., Nemotron) may accept provider-specific extra params.
@@ -660,6 +681,7 @@ def chat():
             stream = client.chat.completions.create(
                 **kwargs
             )
+            full_response = ""
             for chunk in stream:
                 delta = ""
                 try:
@@ -667,8 +689,12 @@ def chat():
                 except (AttributeError, IndexError):
                     pass
                 if delta:
+                    full_response += delta
                     payload = {"choices": [{"delta": {"content": delta}}]}
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            
+            # Cache the full response for future identical prompts
+            prompt_cache[cache_key] = full_response
             yield "data: [DONE]\n\n"
         except Exception as e:
             # The OpenAI SDK often wraps underlying httpx errors into a generic
@@ -697,18 +723,23 @@ def chat():
             "X-Accel-Buffering": "no",
         },
     )
+  except Exception as e:
+    return jsonify({"error": "Chat request failed", "detail": str(e)}), 500
 
 
 @app.route("/api/health")
 def health():
-    return {
-        "ok": True,
-        "app": "Pravaah",
-        "model": MODEL,
-        "base_url": BASE_URL,
-        "has_key": bool(API_KEY),
-        "instructions_loaded": bool(load_custom_instructions()),
-    }
+    try:
+        return {
+            "ok": True,
+            "app": "Pravaah",
+            "model": MODEL,
+            "base_url": BASE_URL,
+            "has_key": bool(API_KEY),
+            "instructions_loaded": bool(load_custom_instructions()),
+        }
+    except Exception as e:
+        return jsonify({"error": "Health check failed", "detail": str(e)}), 500
 
 
 if __name__ == "__main__":
