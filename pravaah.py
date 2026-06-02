@@ -473,7 +473,7 @@ async function sendMessage(){
       const { done, value } = await reader.read();
       if(done) break;
       buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\\n");
+      const lines = buffer.split("\n");
       buffer = lines.pop() || "";
 
       for(const line of lines){
@@ -582,10 +582,10 @@ function escHtml(t){
 function renderMarkdown(text){
   if(!text) return "";
   let t = escHtml(text);
-  t = t.replace(/\`\`\`(\w*)\\n?([\\s\\S]*?)\`\`\`/g, (_, lang, code) =>
+  t = t.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
     `<pre><button type="button" class="copy-btn" onclick="copyCode(this)">copy</button><code>${code.trim()}</code></pre>`
   );
-  t = t.replace(/\`([^\`]+)\`/g, "<code>$1</code>");
+  t = t.replace(/`([^`]+)`/g, "<code>$1</code>");
   t = t.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
   t = t.replace(/\*(.+?)\*/g, "<em>$1</em>");
   t = t.replace(/^### (.+)$/gm, "<h4 style='margin:.8em 0 .4em'>$1</h4>");
